@@ -24,47 +24,39 @@ import (
 	"github.com/stateful/runme/v3/internal/command"
 	"github.com/stateful/runme/v3/internal/config"
 	"github.com/stateful/runme/v3/internal/dockerexec"
+	"github.com/stateful/runme/v3/internal/project/projectservice"
 	"github.com/stateful/runme/v3/internal/runnerv2client"
+	"github.com/stateful/runme/v3/internal/runnerv2service"
+	"github.com/stateful/runme/v3/internal/server"
 	runmetls "github.com/stateful/runme/v3/internal/tls"
+	parserv1 "github.com/stateful/runme/v3/pkg/api/gen/proto/go/runme/parser/v1"
+	projectv1 "github.com/stateful/runme/v3/pkg/api/gen/proto/go/runme/project/v1"
+	runnerv2 "github.com/stateful/runme/v3/pkg/api/gen/proto/go/runme/runner/v2"
+	"github.com/stateful/runme/v3/pkg/document/editor/editorservice"
 	"github.com/stateful/runme/v3/pkg/project"
 )
 
-var (
-	container    = dig.New()
-	commandScope = container.Scope("command")
-	serverScope  = container.Scope("server")
-)
+var defaultBuilder = NewBuilder()
 
-func DecorateRoot(decorator interface{}, opts ...dig.DecorateOption) error {
-	return container.Decorate(decorator, opts...)
+type Builder struct {
+	*dig.Container
 }
 
-// InvokeForCommand is used to invoke the function with the given dependencies.
-// The package will automatically figure out how to instantiate them
-// using the available configuration.
-//
-// Use it only for commands because it supports only singletons
-// created during the program initialization.
-func InvokeForCommand(function interface{}, opts ...dig.InvokeOption) error {
-	err := commandScope.Invoke(function, opts...)
-	return dig.RootCause(err)
+func NewBuilder() *Builder {
+	b := Builder{Container: dig.New()}
+	b.init()
+	return &b
 }
 
-// InvokeForServer is similar to InvokeForCommand, but it does not provide
-// all the dependencies, in particular, it does not provide dependencies
-// that differ per request.
-func InvokeForServer(function interface{}, opts ...dig.InvokeOption) error {
-	err := serverScope.Invoke(function, opts...)
-	return dig.RootCause(err)
-}
-
-func mustProvide(err error) {
-	if err != nil {
-		panic("failed to provide: " + err.Error())
+func (b *Builder) init() {
+	mustProvide := func(err error) {
+		if err != nil {
+			panic("failed to provide: " + err.Error())
+		}
 	}
-}
 
-func init() {
+	container := b
+
 	mustProvide(container.Provide(getClient))
 	mustProvide(container.Provide(getClientFactory))
 	mustProvide(container.Provide(getCommandFactory))
@@ -74,41 +66,38 @@ func init() {
 	mustProvide(container.Provide(getProject))
 	mustProvide(container.Provide(getProjectFilters))
 	mustProvide(container.Provide(getRootConfig))
-	mustProvide(container.Provide(getUserConfigDir))
+	mustProvide(container.Provide(getServer))
+}
+
+func Decorate(decorator interface{}, opts ...dig.DecorateOption) error {
+	return defaultBuilder.Decorate(decorator, opts...)
+}
+
+// Invoke is used to invoke the function with the given dependencies.
+// The package will automatically figure out how to instantiate them
+// using the available configuration.
+func Invoke(function interface{}, opts ...dig.InvokeOption) error {
+	err := defaultBuilder.Invoke(function, opts...)
+	return dig.RootCause(err)
 }
 
 func getClient(cfg *config.Config, logger *zap.Logger) (*runnerv2client.Client, error) {
-	if cfg.Server == nil {
-		return nil, nil
+	clientConn, err := getGRPCClient(cfg)
+	if err != nil {
+		return nil, err
 	}
-
-	var opts []grpc.DialOption
-
-	if cfg.Server.Tls != nil && cfg.Server.Tls.Enabled {
-		// It's ok to dereference TLS fields because they are checked in [getRootConfig].
-		tlsConfig, err := runmetls.LoadClientConfig(*cfg.Server.Tls.CertFile, *cfg.Server.Tls.KeyFile)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		creds := credentials.NewTLS(tlsConfig)
-		opts = append(opts, grpc.WithTransportCredentials(creds))
-	} else {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if clientConn == nil {
+		return nil, errors.New("client connection is not configured")
 	}
-
-	return runnerv2client.New(
-		cfg.Server.Address,
-		logger,
-		opts...,
-	)
+	return runnerv2client.New(clientConn, logger), nil
 }
 
 type ClientFactory func() (*runnerv2client.Client, error)
 
-func getClientFactory(cfg *config.Config, logger *zap.Logger) ClientFactory {
+func getClientFactory(cfg *config.Config, logger *zap.Logger) (ClientFactory, error) {
 	return func() (*runnerv2client.Client, error) {
 		return getClient(cfg, logger)
-	}
+	}, nil
 }
 
 func getCommandFactory(docker *dockerexec.Docker, logger *zap.Logger, proj *project.Project) command.Factory {
@@ -147,6 +136,31 @@ func getDocker(c *config.Config, logger *zap.Logger) (*dockerexec.Docker, error)
 	return dockerexec.New(options)
 }
 
+func getGRPCClient(cfg *config.Config) (*grpc.ClientConn, error) {
+	if cfg.Server == nil {
+		return nil, nil
+	}
+
+	opts := []grpc.DialOption{
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(cfg.Server.MaxMessageSize)),
+	}
+
+	if tls := cfg.Server.Tls; tls != nil && tls.Enabled {
+		// It's ok to dereference TLS fields because they are checked in [getRootConfig].
+		tlsConfig, err := runmetls.LoadClientConfig(*cfg.Server.Tls.CertFile, *cfg.Server.Tls.KeyFile)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		creds := credentials.NewTLS(tlsConfig)
+		opts = append(opts, grpc.WithTransportCredentials(creds))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	conn, err := grpc.NewClient(cfg.Server.Address, opts...)
+	return conn, errors.WithStack(err)
+}
+
 func getLogger(c *config.Config) (*zap.Logger, error) {
 	if c == nil || c.Log == nil || !c.Log.Enabled {
 		return zap.NewNop(), nil
@@ -166,7 +180,7 @@ func getLogger(c *config.Config) (*zap.Logger, error) {
 	}
 
 	if c.Log.Verbose {
-		zapConfig.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
+		zapConfig.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
 		zapConfig.Development = true
 		zapConfig.Encoding = "console"
 		zapConfig.EncoderConfig = zap.NewDevelopmentEncoderConfig()
@@ -266,7 +280,7 @@ func getProjectFilters(c *config.Config) ([]project.Filter, error) {
 	return filters, nil
 }
 
-func getRootConfig(cfgLoader *config.Loader, userCfgDir UserConfigDir) (*config.Config, error) {
+func getRootConfig(cfgLoader *config.Loader) (*config.Config, error) {
 	var cfg *config.Config
 
 	items, err := cfgLoader.RootConfigs()
@@ -284,6 +298,11 @@ func getRootConfig(cfgLoader *config.Loader, userCfgDir UserConfigDir) (*config.
 	if cfg.Server != nil && cfg.Server.Tls != nil && cfg.Server.Tls.Enabled {
 		tls := cfg.Server.Tls
 
+		userCfgDir, err := os.UserConfigDir()
+		if err != nil {
+			return nil, errors.WithMessage(err, "failed to get user config directory")
+		}
+
 		if tls.CertFile == nil {
 			path := filepath.Join(string(userCfgDir), "runme", "tls", "cert.pem")
 			tls.CertFile = &path
@@ -297,9 +316,25 @@ func getRootConfig(cfgLoader *config.Loader, userCfgDir UserConfigDir) (*config.
 	return cfg, nil
 }
 
-type UserConfigDir string
+func getServer(cfg *config.Config, cmdFactory command.Factory, logger *zap.Logger) (*server.Server, error) {
+	if cfg.Server == nil {
+		return nil, nil
+	}
 
-func getUserConfigDir() (UserConfigDir, error) {
-	dir, err := os.UserConfigDir()
-	return UserConfigDir(dir), errors.WithStack(err)
+	parserService := editorservice.NewParserServiceServer(logger)
+	projectService := projectservice.NewProjectServiceServer(logger)
+	runnerService, err := runnerv2service.NewRunnerService(cmdFactory, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return server.New(
+		cfg,
+		logger,
+		func(sr grpc.ServiceRegistrar) {
+			parserv1.RegisterParserServiceServer(sr, parserService)
+			projectv1.RegisterProjectServiceServer(sr, projectService)
+			runnerv2.RegisterRunnerServiceServer(sr, runnerService)
+		},
+	)
 }
